@@ -4,3 +4,5 @@ fury
 scipy
 vtk
 matplotlib
+scikit-image
+scikit-learn
