@@ -2,7 +2,7 @@ from scipy.spatial import KDTree
 from copy import deepcopy
 import numpy as np
 import matplotlib.pyplot as plt
-from skimage.color import hsv2rgb, rgb2lab, deltaE_ciede2000
+from skimage.color import hsv2rgb, rgb2lab, deltaE_ciede2000, deltaE_cie76, deltaE_ciede94
 from scipy.spatial.distance import pdist, squareform
 from sklearn.cluster import KMeans
 import itertools
@@ -13,7 +13,7 @@ from scilpy.tractanalysis.streamlines_metrics import compute_tract_counts_map
 import tqdm
 from scipy.spatial import KDTree
 
-def select_dissimilar_colors(nb_sample, h_range=(0, 1), s_range=(0.5, 1), v_range=(0.5, 1)):
+def select_dissimilar_colors(nb_sample, h_range=(0, 1), s_range=(0.25, 1), v_range=(0.25, 1)):
     """
     Select `nb_sample` dissimilar colors by sampling HSV values and computing distances in the CIELAB space.
 
@@ -141,28 +141,41 @@ def compute_euclidean_distance_matrix(coordinates):
 
 def compute_bundle_distance_matrix(sft_list, distance='dice'):
     densities = []
+    union = np.zeros(sft_list[0].dimensions)
     print('Computing densities')
     for sft in tqdm.tqdm(sft_list):
         sft.to_vox()
         sft.to_corner()
-        counts_map = compute_tract_counts_map(sft.streamlines, sft.dimensions)
-        # if distance != 'weighted_dice':
-        #     counts_map[counts_map > 0] = 1
-        densities.append(counts_map)
-    
-    print('\nComputing distance matrix')
-    if distance == 'bundle_adjacency':
-        indices = []
-        trees = []
-        for i in range(len(sft_list)):
-            indices.append(np.argwhere(densities[i]))    
-            trees.append(KDTree(indices[-1]))
 
+        counts_map = compute_tract_counts_map(sft.streamlines, sft.dimensions)
+        if distance != 'weighted_dice':
+            counts_map[counts_map > 0] = 1
+
+        # Union is only used for bundle adjacency
+        union += counts_map
+        densities.append(counts_map.astype(np.uint32))
+    union[union > 0] = 1
+
+    
+    if distance == 'bundle_adjacency':
+        precomputed_distances = []
+        print('Precomputing distances')
+        for i in tqdm.tqdm(range(len(sft_list))):
+            # union_ind = np.argwhere(union)
+            curr_tree = KDTree(np.argwhere(densities[i]))
+            distances = curr_tree.query(np.argwhere(union), k=1,
+                                        distance_upper_bound=10)
+            tmp_map = np.zeros(sft_list[i].dimensions, dtype=float)
+            tmp_map[np.where(union)] = distances[0]
+            tmp_map[np.isinf(tmp_map)] = -1
+            precomputed_distances.append(tmp_map)
+
+    print('\nComputing distance matrix')
     comb_list = list(itertools.combinations(range(len(sft_list)), 2))
     distance_matrix = np.zeros((len(sft_list), len(sft_list)))
     for i, j in tqdm.tqdm(comb_list):
         if distance == 'dice':
-            dice, _ = compute_dice_voxel(densities[i], densities[j])
+            dice = compute_dice_voxel(densities[i], densities[j])
             distance_matrix[i, j] = 1 - dice
             distance_matrix[j, i] = 1 - dice
         elif distance == 'weighted_dice':
@@ -170,19 +183,20 @@ def compute_bundle_distance_matrix(sft_list, distance='dice'):
             distance_matrix[i, j] = 1 - w_dice
             distance_matrix[j, i] = 1 - w_dice
         elif distance == 'bundle_adjacency':
-
-            distance_1, _ = trees[i].query(indices[j], k=1,
-                                           distance_upper_bound=10)
-            distance_2, _ = trees[j].query(indices[i], k=1,
-                                           distance_upper_bound=10)
-            ba = min(np.min(distance_1), np.min(distance_2))
+            distances = precomputed_distances[j] * densities[i]
+            
+            # avoid np.inf and 0
+            values = distances[distances > 0]
+            ba = np.min(values) if len(values) > 0 else -1
 
             distance_matrix[i, j] = ba
             distance_matrix[j, i] = ba
         else:
             raise ValueError(f"Unknown distance metric: {distance}")
-    real_max = np.max(distance_matrix[~np.isinf(distance_matrix)])
-    distance_matrix[np.isinf(distance_matrix)] = 2 * real_max
+        
+    # distance_matrix = distance_matrix + distance_matrix.T
+    real_max = np.max(distance_matrix[distance_matrix > 0])
+    distance_matrix[distance_matrix < 0] = 2 * real_max
 
     return distance_matrix
 
@@ -257,11 +271,10 @@ def greedy_coloring(distance_matrix, colors, max_distance=0.5,
             available_colors_id = deepcopy(color_indices_ori)
 
         if coloring_method == 'first_available':
-            colors_list[pos] = available_colors_id.pop()
+            colors_list[pos] = available_colors_id.pop(0)
         elif 'most' in coloring_method:
             if np.all(neighbors_colors_id == -1):
-                colors_list[pos] = available_colors_id.pop(
-                    len(available_colors_id) // 2)
+                colors_list[pos] = available_colors_id.pop(0)
                 continue
             # remove all -1
             distance_matrix_curr = distance_matrix[pos][neighbors][neighbors_colors_id != -1]
@@ -287,7 +300,7 @@ def greedy_coloring(distance_matrix, colors, max_distance=0.5,
             else:
                 print('Invalid coloring method')
                 break
-            colors_list[pos] = available_colors_id.pop(opt_id)
+            colors_list[pos] = available_colors_id.pop(0)
 
         else:
             print('Invalid coloring method')

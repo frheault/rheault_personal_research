@@ -88,7 +88,7 @@ def main():
 
     rgb_colors = select_dissimilar_colors(
         args.nb_color, h_range=(0, 1), s_range=(0.5, 1), v_range=(0.7, 1))
-    # plot_colors(rgb_colors)
+    plot_colors(rgb_colors)
 
     sft_lists = [load_tractogram_with_reference(parser, args, filename)
                  for filename in args.in_tractograms]
@@ -97,7 +97,7 @@ def main():
         NB_SAMPLE / args.nb_color), axis=0)[:NB_SAMPLE]
 
     indices = np.arange(NB_SAMPLE)
-    np.random.shuffle(indices)
+    # np.random.shuffle(indices)
     # print(sft_lists)
     sft_lists = [sft_lists[i] for i in indices]
     filenames = [args.in_tractograms[i] for i in indices]
