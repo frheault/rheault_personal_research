@@ -6,6 +6,7 @@ from skimage.color import hsv2rgb, rgb2lab, deltaE_ciede2000
 from scipy.spatial.distance import pdist, squareform
 from sklearn.cluster import KMeans
 import itertools
+import logging
 
 from scilpy.tractanalysis.reproducibility_measures import \
     compute_dice_voxel, compute_bundle_adjacency_voxel
@@ -139,46 +140,60 @@ def compute_euclidean_distance_matrix(coordinates):
     distance_matrix = squareform(pdist(coordinates, 'euclidean'))
     return distance_matrix
 
-def compute_bundle_distance_matrix(sft_list, distance='dice'):
+def compute_bundle_distance_matrix(sft_list, distance='dice',
+                                   single_compare=None, use_mean=False,
+                                   disable_tqdm=False):
+    if single_compare is not None:
+        sft_list = [single_compare] + sft_list
+
     densities = []
-    print('Computing densities')
-    for sft in tqdm.tqdm(sft_list):
+    logging.debug('Computing densities')
+    for sft in tqdm.tqdm(sft_list, disable=disable_tqdm):
         sft.to_vox()
         sft.to_corner()
         counts_map = compute_tract_counts_map(sft.streamlines, sft.dimensions)
-        # if distance != 'weighted_dice':
-        #     counts_map[counts_map > 0] = 1
         densities.append(counts_map)
+        sft.to_rasmm()
+        sft.to_center()
     
-    print('\nComputing distance matrix')
+    logging.debug('\nComputing distance matrix')
     if distance == 'bundle_adjacency':
         indices = []
         trees = []
         for i in range(len(sft_list)):
-            indices.append(np.argwhere(densities[i]))    
+            indices.append(np.argwhere(densities[i]))
             trees.append(KDTree(indices[-1]))
 
-    comb_list = list(itertools.combinations(range(len(sft_list)), 2))
-    distance_matrix = np.zeros((len(sft_list), len(sft_list)))
-    for i, j in tqdm.tqdm(comb_list):
+    if single_compare is not None:
+        comb_list = [(i, 0) for i in range(len(sft_list))]
+        distance_matrix = np.zeros((len(sft_list), 1))
+    else:
+        comb_list = list(itertools.combinations(range(len(sft_list)), 2))
+        distance_matrix = np.zeros((len(sft_list), len(sft_list)))
+    for i, j in tqdm.tqdm(comb_list, disable=disable_tqdm):
         if distance == 'dice':
             dice, _ = compute_dice_voxel(densities[i], densities[j])
             distance_matrix[i, j] = 1 - dice
-            distance_matrix[j, i] = 1 - dice
+            # distance_matrix[j, i] = 1 - dice
         elif distance == 'weighted_dice':
             _, w_dice = compute_dice_voxel(densities[i], densities[j])
             distance_matrix[i, j] = 1 - w_dice
-            distance_matrix[j, i] = 1 - w_dice
+            # distance_matrix[j, i] = 1 - w_dice
         elif distance == 'bundle_adjacency':
 
             distance_1, _ = trees[i].query(indices[j], k=1,
                                            distance_upper_bound=10)
             distance_2, _ = trees[j].query(indices[i], k=1,
                                            distance_upper_bound=10)
-            ba = min(np.min(distance_1), np.min(distance_2))
-
+            distance_1[np.isinf(distance_1)] = 20
+            distance_2[np.isinf(distance_2)] = 20
+            
+            distance_concat = np.concatenate([distance_1, distance_2])
+            ba = np.mean(distance_concat) if use_mean else np.min(distance_concat)
             distance_matrix[i, j] = ba
-            distance_matrix[j, i] = ba
+        
+            if single_compare is None:
+                distance_matrix[j, i] = distance_matrix[i, j]
         else:
             raise ValueError(f"Unknown distance metric: {distance}")
     real_max = np.max(distance_matrix[~np.isinf(distance_matrix)])
@@ -238,6 +253,9 @@ def find_optimal_index(arr, weights=None, maximize=True):
 
 def greedy_coloring(distance_matrix, colors, max_distance=0.5,
                     coloring_method='first_available'):
+    if np.allclose(distance_matrix, 0):
+        print('WARNING: All distances are zero')
+        return np.arange(distance_matrix.shape[0])
     nb_sample = distance_matrix.shape[0]
     nb_color = colors.shape[0]
     color_indices_ori = list(range(nb_color))

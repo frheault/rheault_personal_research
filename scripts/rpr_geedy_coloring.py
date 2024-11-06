@@ -11,6 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import KDTree
 from sklearn.cluster import KMeans
+import logging
 
 from my_research.utils.coloring import (select_dissimilar_colors,
                                         compute_cielab_distances,
@@ -30,6 +31,12 @@ from scilpy.io.utils import (add_json_args,
                              assert_output_dirs_exist_and_empty,
                              validate_nbr_processes)
 
+from scilpy.image.volume_operations import register_image
+import nibabel as nib
+from dipy.io.stateful_tractogram import Space, StatefulTractogram
+from dipy.io.streamline import load_tractogram
+from dipy.tracking.streamline import transform_streamlines
+from scilpy.tractograms.tractogram_operations import flip_sft
 
 def _build_arg_parser():
     p = argparse.ArgumentParser(
@@ -51,7 +58,14 @@ def _build_arg_parser():
     p.add_argument('--nb_color', type=int, default=20,
                    help="Number of dissimilar colors (palette) to generate "
                         "[%(default)s].")
-    
+    p.add_argument('--enable_symmetry', action='store_true',
+                     help="Enable symmetry to match colors left to right.")
+    p.add_argument('--in_anat',
+                   help='Path of the reference file (.nii or nii.gz).')
+    p.add_argument('--target_template',
+                   help='Path to the target MNI152 template for registration. '
+                        'If in_anat has a skull, select a MNI152 template '
+                        'with a skull and vice-versa.')
     add_reference_arg(p)
     add_overwrite_arg(p)
     add_verbose_arg(p)
@@ -83,41 +97,114 @@ def main():
                                        create_dir=True)
     assert_outputs_exist(parser, args, [], [args.out_LUT, args.out_palette])
     assert_headers_compatible(parser, args.in_tractograms)
-
+    args.in_tractograms = sorted(args.in_tractograms)
     np.random.seed(0)
 
     rgb_colors = select_dissimilar_colors(
         args.nb_color, h_range=(0, 1), s_range=(0.5, 1), v_range=(0.7, 1))
     # plot_colors(rgb_colors)
 
-    sft_lists = [load_tractogram_with_reference(parser, args, filename)
+    sft_list = [load_tractogram_with_reference(parser, args, filename)
                  for filename in args.in_tractograms]
-    NB_SAMPLE = len(sft_lists)
+    NB_SAMPLE = len(sft_list)
     colors_repeat = np.repeat(rgb_colors, np.ceil(
         NB_SAMPLE / args.nb_color), axis=0)[:NB_SAMPLE]
 
     indices = np.arange(NB_SAMPLE)
-    np.random.shuffle(indices)
-    # print(sft_lists)
-    sft_lists = [sft_lists[i] for i in indices]
+    if not args.enable_symmetry:
+        np.random.shuffle(indices)
+    # print(sft_list)
+    sft_list = [sft_list[i] for i in indices]
     filenames = [args.in_tractograms[i] for i in indices]
+    print(filenames)
 
-    distance_matrix = compute_bundle_distance_matrix(sft_lists,
-                                                     distance='bundle_adjacency')
+    
+    if args.enable_symmetry:
+        matched = {}
+        if args.target_template and args.in_anat:
+            reference_img = nib.load(args.in_anat)
+            reference_data = reference_img.get_fdata(dtype=np.float32)
+            reference_affine = reference_img.affine
+
+            target_template_img = nib.load(args.target_template)
+            target_template_data = target_template_img.get_fdata(dtype=np.float32)
+            target_template_affine = target_template_img.affine
+
+            # Register the DWI data to the template
+            logging.info('Starting registration...')
+            _, transformation = register_image(
+                target_template_data,
+                target_template_affine,
+                reference_data,
+                reference_affine)
+
+        for i, (filename, sft) in enumerate(zip(filenames, sft_list)):
+            logging.getLogger().setLevel(logging.ERROR)
+            if args.target_template and args.in_anat:
+                streamlines = sft.streamlines.copy()
+                streamlines = transform_streamlines(streamlines,
+                                                    np.linalg.inv(transformation),
+                                                    in_place=False)
+
+                new_sft = StatefulTractogram(streamlines,
+                                            args.target_template,
+                                            Space.RASMM)
+                new_sft = flip_sft(new_sft, ['x'])
+                streamlines = new_sft.streamlines.copy()
+
+                streamlines = transform_streamlines(streamlines,
+                                                    transformation,
+                                                    in_place=False)
+                new_sft = StatefulTractogram(streamlines,
+                                            args.in_anat,
+                                            Space.RASMM)
+
+            distance_matrix = compute_bundle_distance_matrix(sft_list,
+                                                            distance='bundle_adjacency',
+                                                            single_compare=new_sft,
+                                                            use_mean=True,
+                                                            disable_tqdm=True)
+
+            best_match = int(np.argsort(distance_matrix, axis=0)[1][0]) - 1
+            # best_filename = filenames[best_match]
+            if best_match not in matched.values() and best_match not in matched.keys():
+                matched[i] = best_match
+                # matched[filename] = best_filename
+        
+        symmetric_sft_list = [sft_list[i] for i in matched.keys()]
+        # for i in range(len(symmetric_sft_list)):
+        #     save_tractogram(symmetric_sft_list[i], f'{args.out_dir}/symmetric_{os.path.basename(filenames[i])}')
+        # from time import sleep
+        # sleep(100)
+        logging.getLogger().setLevel(args.verbose)
+
+        distance_matrix = compute_bundle_distance_matrix(symmetric_sft_list,
+                                                        distance='bundle_adjacency')
+    else:
+        logging.getLogger().setLevel(args.verbose)
+
+        distance_matrix = compute_bundle_distance_matrix(sft_list,
+                                                        distance='bundle_adjacency')
     print(distance_matrix)
-    # MAX_DIST = np.std(distance_matrix)
+    print(filenames)
+    print(matched)
+
     MAX_DIST = np.std(distance_matrix)
     print(MAX_DIST, '0')
-    # Plot histogram of distance
-    # plt.hist(distance_matrix.flatten(), bins=20)
-    # plt.show()
+
     ordering = greedy_coloring(distance_matrix, rgb_colors,
                                max_distance=MAX_DIST,
                                coloring_method=args.coloring_method)
     print(ordering)
+    if args.enable_symmetry:
+        new_ordering = np.zeros(len(sft_list), dtype=int)
+        for i, (key, value) in enumerate(matched.items()):
+            new_ordering[key] = ordering[i]
+            new_ordering[value] = ordering[i]
+        ordering = new_ordering
     rgb_colors = rgb_colors[ordering]
     # Save tractograms
-    for sft, filename, rgb_color in zip(sft_lists, filenames, rgb_colors):
+    for sft, filename, rgb_color in zip(sft_list, filenames, rgb_colors):
         basename = os.path.basename(filename)
         out_filename = f'{args.out_dir}/{basename}'
         red, green, blue = rgb_color * 255
