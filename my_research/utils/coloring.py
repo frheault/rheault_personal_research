@@ -140,98 +140,83 @@ def compute_euclidean_distance_matrix(coordinates):
     distance_matrix = squareform(pdist(coordinates, 'euclidean'))
     return distance_matrix
 
-def compute_bundle_distance_matrix(sft_list, distance='dice',
-                                   single_compare=None, use_mean=False,
+def compute_bundle_distance_matrix(sft_list, symmetry=None,
+                                   distance='dice', use_mean=False,
                                    disable_tqdm=False):
-    if single_compare is not None:
-        sft_list = [single_compare] + sft_list
+
+    if symmetry is not None:
+        sft_list += symmetry
 
     densities = []
     union = np.zeros(sft_list[0].dimensions)
-    print('Computing densities')
-    for sft in tqdm.tqdm(sft_list, disable_tqdm=disable_tqdm):
+    logging.debug('Computing densities')
+    for i, sft in enumerate(tqdm.tqdm(sft_list, disable=disable_tqdm)):
         sft.to_vox()
         sft.to_corner()
-
-        counts_map = compute_tract_counts_map(sft.streamlines, sft.dimensions)
-        densities.append(counts_map)
+        counts_map = compute_tract_counts_map(sft.streamlines,
+                                              sft.dimensions).astype(np.uint32)
         sft.to_rasmm()
         sft.to_center()
-    
-    logging.debug('\nComputing distance matrix')
-    if distance == 'bundle_adjacency':
-        indices = []
-        trees = []
-        for i in range(len(sft_list)):
-            indices.append(np.argwhere(densities[i]))
-            trees.append(KDTree(indices[-1]))
-
-    if single_compare is not None:
-        comb_list = [(i, 0) for i in range(len(sft_list))]
-        distance_matrix = np.zeros((len(sft_list), 1))
-    else:
-        comb_list = list(itertools.combinations(range(len(sft_list)), 2))
-        distance_matrix = np.zeros((len(sft_list), len(sft_list)))
-    for i, j in tqdm.tqdm(comb_list, disable=disable_tqdm):
         if distance != 'weighted_dice':
             counts_map[counts_map > 0] = 1
 
         # Union is only used for bundle adjacency
-        union += counts_map
         densities.append(counts_map.astype(np.uint32))
+        # nib.save(nib.Nifti1Image(counts_map, np.eye(4)), f'density{i}.nii.gz')
+
+    union = np.sum(densities, axis=0)
     union[union > 0] = 1
 
-    
     if distance == 'bundle_adjacency':
         precomputed_distances = []
-        print('Precomputing distances')
-        for i in tqdm.tqdm(range(len(sft_list))):
-            # union_ind = np.argwhere(union)
+        logging.debug('\,Precomputing distances')
+        union_ind = np.argwhere(union)
+        union_pos = np.where(union)
+        for i in tqdm.tqdm(range(len(sft_list)), disable=disable_tqdm):
             curr_tree = KDTree(np.argwhere(densities[i]))
-            distances = curr_tree.query(np.argwhere(union), k=1,
-                                        distance_upper_bound=10)
-            tmp_map = np.zeros(sft_list[i].dimensions, dtype=float)
-            tmp_map[np.where(union)] = distances[0]
-            tmp_map[np.isinf(tmp_map)] = -1
+            distances = curr_tree.query(union_ind, k=1,
+                                        distance_upper_bound=20)
+            tmp_map = np.ones(sft_list[i].dimensions, dtype=float) * np.inf
+            tmp_map[union_pos] = distances[0]
+            tmp_map[np.isinf(tmp_map)] = 20
             precomputed_distances.append(tmp_map)
 
-    print('\nComputing distance matrix')
-    comb_list = list(itertools.combinations(range(len(sft_list)), 2))
-    distance_matrix = np.zeros((len(sft_list), len(sft_list)))
-    for i, j in tqdm.tqdm(comb_list):
+    offset = 0
+    if symmetry is not None:
+        offset = len(sft_list) // 2
+        comb_list = []
+        for i in range(len(sft_list) // 2):
+            comb_list += list(itertools.product(range(len(sft_list) // 2), [i + offset]))
+        distance_matrix = np.zeros((len(sft_list) // 2, len(sft_list) // 2))
+    else:
+        comb_list = list(itertools.combinations(range(len(sft_list)), 2))
+        distance_matrix = np.zeros((len(sft_list), len(sft_list)))
+    
+    logging.debug('\nComputing distance matrix')
+    for i, j in tqdm.tqdm(comb_list, disable=disable_tqdm):
         if distance == 'dice':
-            dice = compute_dice_voxel(densities[i], densities[j])
-            distance_matrix[i, j] = 1 - dice
-            # distance_matrix[j, i] = 1 - dice
+            dice, _ = compute_dice_voxel(densities[i], densities[j])
+            distance_matrix[i, j - offset] = 1 - dice
         elif distance == 'weighted_dice':
             _, w_dice = compute_dice_voxel(densities[i], densities[j])
-            distance_matrix[i, j] = 1 - w_dice
-            # distance_matrix[j, i] = 1 - w_dice
+            distance_matrix[i, j - offset] = 1 - w_dice
         elif distance == 'bundle_adjacency':
+            distances = precomputed_distances[i][np.where(densities[j])]
+            values = distances[~np.isinf(distances)]
 
-            distance_1, _ = trees[i].query(indices[j], k=1,
-                                           distance_upper_bound=10)
-            distance_2, _ = trees[j].query(indices[i], k=1,
-                                           distance_upper_bound=10)
-            distance_1[np.isinf(distance_1)] = 20
-            distance_2[np.isinf(distance_2)] = 20
-            
-            distance_concat = np.concatenate([distance_1, distance_2])
-            ba = np.mean(distance_concat) if use_mean else np.min(distance_concat)
-            distances = precomputed_distances[j] * densities[i]
-            
-            # avoid np.inf and 0
-            values = distances[distances > 0]
-            ba = np.min(values) if len(values) > 0 else -1
-
-            distance_matrix[i, j] = ba
-        
-            if single_compare is None:
-                distance_matrix[j, i] = distance_matrix[i, j]
+            if len(values) == 0:
+                ba = 20
+            else:
+                ba = np.mean(values) if use_mean else np.min(values)
+            distance_matrix[i, j - offset] = ba
         else:
             raise ValueError(f"Unknown distance metric: {distance}")
-        
+
+        distance_matrix[j - offset, i] = distance_matrix[i, j - offset]
     # distance_matrix = distance_matrix + distance_matrix.T
+    if len(distance_matrix[distance_matrix > 0]) == 0:
+        print('WARNING: All distances are zero')
+        return distance_matrix
     real_max = np.max(distance_matrix[distance_matrix > 0])
     distance_matrix[distance_matrix < 0] = 2 * real_max
 
@@ -307,7 +292,6 @@ def greedy_coloring(distance_matrix, colors, max_distance=0.5,
                                    set(neighbors_colors_id))
         if len(available_colors_id) == 0:
             print('WARNING')
-            print(pos)
             available_colors_id = deepcopy(color_indices_ori)
 
         if coloring_method == 'first_available':
@@ -340,7 +324,8 @@ def greedy_coloring(distance_matrix, colors, max_distance=0.5,
             else:
                 print('Invalid coloring method')
                 break
-            colors_list[pos] = available_colors_id.pop(0)
+
+            colors_list[pos] = available_colors_id.pop(opt_id)
 
         else:
             print('Invalid coloring method')
