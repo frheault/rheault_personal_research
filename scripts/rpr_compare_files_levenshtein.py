@@ -48,8 +48,8 @@ def plot_levenshtein_distances(file_paths):
     file_distances = []
     labels = []
 
-    # comb = list(product(file_paths, repeat=2))[1:len(file_paths)]
-    comb = list(combinations(file_paths, 2)) 
+    comb = list(product(file_paths, repeat=2))[1:len(file_paths)]
+    # comb = list(combinations(file_paths, 2)) 
     # Generate combinations of files
     for ref_file, alt_file in comb:
         ref_lines = read_file(ref_file)
