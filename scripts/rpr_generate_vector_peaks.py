@@ -98,51 +98,108 @@ def sf_to_sh_internal(sf):
     return sh
 
 
-def generate_dirac_sh(normal_vectors, sphere, sh_order):
-    """Generates SH coefficients approximating a Dirac delta function pointing in the normal direction."""
-    # We can approximate a Dirac by projecting the normal vector onto a high-order SH basis.
-    # A simple approach is to use the normal vector itself as the direction of a very peaked function.
-    # For a Dirac-like SH, we want it to be strongly aligned with the normal.
-    # Let's try a simple approach: Project the normal vector onto the SH basis.
+import heapq
+import trimesh
+def split_fodf(sphere, sf, peaks):
+    mesh = trimesh.Trimesh(vertices=sphere.vertices, faces=sphere.faces)
+    adjacency_list = mesh.vertex_neighbors
+    num_vertices = len(mesh.vertices)
+    negative_potential = sf
+    num_peaks = 3
+    
+    seed_indices = []
+    for i in range(num_peaks):
+        peak = peaks[i*3:(i+1)*3]
+        if not peak.any():
+            continue
+        indice = np.argmax(np.dot(sphere.vertices, peak))
+        seed_indices.append(indice)
 
-    # Generate SH basis for the given order
-    dot_products = np.dot(sphere.vertices, normal_vectors.T)
-    # Using exponential for a sharper falloff, you can experiment with powers too.
-    # e.g., return dot_product ** sharpness_factor  (if sharpness_factor is integer and even)
-    # Maximum value when dot_product = 1 (direction = normal_direction)
-    SFs = np.exp(8.0 * (dot_products - 1.0))
-    SFs /= SFs.max(axis=0)
-    SHs = sf_to_sh_internal(SFs.T)
-    # SHs = []
-    # for SF in SFs.T:
-    #     SF /= SF.shape
-    #     SH = sf_to_sh(SF, sphere, sh_order_max=sh_order, basis_type="tournier07")
-    #     SHs.append(SH)
-    return SHs
+        labels = np.zeros(num_vertices, dtype=int)
+        
+        # Priority queue stores tuples: (potential_value, vertex_index)
+        pq = []
 
+        # Initialize labels and priority queue with seeds
+        for i, seed_idx in enumerate(seed_indices):
+            seed_label = i + 1 # Assign unique positive labels (1, 2, ...)
+            labels[seed_idx] = seed_label
+            heapq.heappush(pq, (negative_potential[seed_idx], seed_idx))
 
-def generate_donut_sh(normal_vectors, sphere, sh_order):
-    """Generates SH coefficients approximating a donut shape perpendicular to the normal direction."""
+        # Process vertices based on potential (lowest first)
+            processed_count = 0
+            while pq and processed_count < num_vertices:
+                current_potential, current_idx = heapq.heappop(pq)
+                
+                # Check if already processed with a potentially lower path
+                # (This check might need refinement depending on exact watershed definition)
+                # A simple check is just based on whether it already has a valid label
+                if labels[current_idx] == 0 and current_idx not in seed_indices:
+                    # This should ideally not happen if seeds are the start points.
+                    # Skip or handle as needed. For seeded watershed, we mostly care about neighbors.
+                    continue 
 
-    # Generate SH basis for the given order
-    dot_product = np.dot(sphere.vertices, normal_vectors.T)
+                current_label = labels[current_idx]
+                if current_label == 0: # Should only happen for non-seeds added later
+                    # This logic path needs careful consideration in seeded watershed
+                    # Often, items are only added to PQ if neighbours of labelled regions.
+                    # Let's adjust the logic: only neighbors of labeled regions get added.
+                    continue # Skip if popped vertex wasn't properly labeled by a neighbor yet
 
-    # Spherical Function for Donut: value is low along normal, high perpendicular
-    # Using 1 - dot_product**2 to create the donut shape
-    # Value will be close to 0 when direction is along normal (dot_product ~ 1 or -1)
-    SFs = 1.0 - np.abs(dot_product) ** (1 / 8.0)
-    # SFs[SFs < 0.25] = 1e-6
-    #  Value will be close to 1 when direction is perpendicular (dot_product ~ 0)
+                processed_count += 1
 
-    # Normlize in the axis 0
-    SFs /= SFs.max(axis=0)
-    # SHs = []
-    # for SF in SFs.T:
-    #     SF /= SF.max()
-    SHs = sf_to_sh_internal(SFs.T)
-    #     SHs.append(SH)
-    return SHs
+                # Examine neighbors
+                neighbors = adjacency_list[current_idx]
+                for neighbor_idx in neighbors:
+                    if labels[neighbor_idx] == 0: # If neighbor is unlabeled
+                        labels[neighbor_idx] = current_label # Assign current label
+                        heapq.heappush(pq, (negative_potential[neighbor_idx], neighbor_idx))
+                    # Optional: Handle boundary condition (watershed lines)
+                    # If neighbor has a *different* positive label, mark as boundary?
+                    # elif labels[neighbor_idx] != current_label and labels[neighbor_idx] > 0:
+                    #     labels[neighbor_idx] = -1 # Mark as boundary (or handle differently)
+                        
+            # Refined approach: Add neighbours of seeds initially, then expand
+            # Let's refine the initialization and loop:
 
+            labels = np.zeros(num_vertices, dtype=int)
+            pq = [] # (potential, vertex_idx, label_from)
+
+            # Initialize: Label seeds and add their *neighbors* to the queue
+            for i, seed_idx in enumerate(seed_indices):
+                seed_label = i + 1
+                labels[seed_idx] = seed_label
+                # Add neighbors of this seed to the queue
+                for neighbor_idx in adjacency_list[seed_idx]:
+                    if labels[neighbor_idx] == 0: # Add only if not already labeled by another seed
+                        # Add with the potential of the neighbor, associated with this seed's label
+                        heapq.heappush(pq, (negative_potential[neighbor_idx], neighbor_idx, seed_label))
+                        # Tentatively label to avoid adding multiple times? Or handle conflicts later.
+                        # Using a 'visited' or tentative label might be useful here.
+
+            # Process queue (vertices sorted by potential)
+            while pq:
+                current_potential, current_idx, label_from = heapq.heappop(pq)
+
+                if labels[current_idx] != 0: # Already assigned a final label
+                    continue
+
+                # Assign the label from the seed region it's being added from
+                labels[current_idx] = label_from
+
+                # Add its unlabeled neighbors to the queue
+                for neighbor_idx in adjacency_list[current_idx]:
+                    if labels[neighbor_idx] == 0:
+                        # Check if already in queue with higher potential? heapq doesn't support decrease-key easily.
+                        # Simplest: just add. The first time it's popped with the lowest potential wins.
+                        heapq.heappush(pq, (negative_potential[neighbor_idx], neighbor_idx, label_from))
+                    # Optional: Detect boundaries
+                    # elif labels[neighbor_idx] > 0 and labels[neighbor_idx] != label_from:
+                    #     # This vertex is adjacent to two different regions. Mark as boundary?
+                    #     labels[current_idx] = -1 # Mark current vertex as boundary
+                    #     # Or mark the edge, or handle boundaries differently.
+
+        return labels
 
 def _build_arg_parser():
     p = argparse.ArgumentParser(
@@ -150,6 +207,8 @@ def _build_arg_parser():
     p.add_argument('in_surface',
                    help='Input file name, in VTK friendly format.')
     p.add_argument('in_fodf',
+                   help='Input file name, in nifti format.')
+    p.add_argument('in_peaks',
                    help='Input file name, in nifti format.')
     p.add_argument('distance', type=int,
                    help='Distance to consider the neighbors.')
@@ -221,108 +280,31 @@ def main():
     has_neighbors = np.where(has_neighbors > 0)[0]
     valid_coords = enclosed_coords[has_neighbors]
 
-    data_sh = np.zeros(ref_img.shape[0:3] + (28, 3), dtype=float)
+    # data_sh = np.zeros(ref_img.shape[0:3] + (28, 3), dtype=float)
     mask_data = np.zeros(ref_img.shape[0:3], dtype=np.uint8)
     mask_data[tuple(valid_coords.T)] = 1
     filename = os.path.join(args.out_dir, "mask.nii.gz")
     nib.save(nib.Nifti1Image(mask_data, ref_img.affine), filename)
     print("Enclosed points time: ", time() - timer)
 
+    peaks_img = nib.load(args.in_peaks)
+    peaks_data = peaks_img.get_fdata(dtype=np.float32)
+
+    fodf_img = nib.load(args.in_fodf)
+    fodf_data = fodf_img.get_fdata(dtype=np.float32)
+
+    sf_data = sh_to_sf(
+        fodf_data[tuple(valid_coords.T)], sphere, sh_order_max=8,
+        basis_type=args.sh_basis, legacy=True)
+    peaks_data = peaks_data[tuple(valid_coords.T)]
+
     # SH_array_sphere = sf_to_sh(np.ones((sphere.vertices.shape[0], 1)))
     distance_map = np.zeros(ref_img.shape, dtype=float)
-    SH_array_sphere = sf_to_sh_internal(
-        np.ones((sphere.vertices.shape[0], 1)))
-    for coord in tqdm.tqdm(valid_coords):
-        D, neighbor_idxs = sfs_tree.query(coord, k=2, distance_upper_bound=DISTANCE)
-        # neighbor_idxs = np.array(sfs_tree.query_ball_point(
-        #     coord, r=min(D + 1, DISTANCE) + 1), dtype=int)
-        if len(neighbor_idxs) == 0:
-            continue
-        neighbor_idxs[neighbor_idxs == len(sfs.vertices)] = 0
+    for i, _ in tqdm.tqdm(enumerate(valid_coords), total=len(valid_coords)):
+        labels = split_fodf(sphere, sf_data[i], peaks_data[i])
+        print(np.unique(labels, return_counts=True))
 
-        # for idx in neighbor_idxs:
-        curr_SH = np.zeros((3, 28))
-        pts = sfs.vertices[neighbor_idxs]
-        normal_vectors = normal_array[neighbor_idxs]
-        distances = np.linalg.norm(pts - coord, axis=-1) - 0.5
-        normal_vectors = normal_vectors / np.linalg.norm(normal_vectors, axis=-1)[:, None]
-        SH_array_dirac = generate_dirac_sh(normal_vectors, sphere, 6)
-        SH_array_donut = generate_donut_sh(normal_vectors, sphere, 6)
-        min_distances = np.min(distances)
 
-        weight_dirac = np.exp((-(distances) ** 2) / ((DISTANCE / 3) ** 2))
-        weight_sphere = np.exp(
-            (-(min_distances - (DISTANCE / 2)) ** 2) / ((DISTANCE / 3) ** 2))
-        weight_donut = np.exp(
-            (-(distances - DISTANCE) ** 2) / ((DISTANCE / 3) ** 2))
-
-        curr_SH[0] = np.mean(SH_array_dirac.T * weight_dirac, axis=1).T
-        curr_SH[1] = SH_array_sphere * weight_sphere
-        curr_SH[2] = np.mean(SH_array_donut.T * weight_donut, axis=1).T
-
-        coord = tuple(coord)
-        distance_map[coord] += np.min(distances)
-        data_sh[coord] += curr_SH.T
-
-    # # Compute what is needed for the priors
-    indices = np.where(mask_data > 0)
-    for i in range(3):
-        tmp = data_sh[..., i]
-        total_energy = np.max(tmp[indices])
-        data_sh[..., i] = np.divide(tmp, total_energy)
-
-    merged_sh = np.sum(data_sh, axis=-1)
-    merged_sh[indices] /= np.repeat(np.max(merged_sh[indices],
-                                    axis=-1)[:, None], 28, axis=-1)
-    todi_obj = TrackOrientationDensityImaging(
-        ref_img.shape[0:3], 'repulsion724')
-    todi_obj.set_todi_from_sh(merged_sh, sh_basis="tournier07")
-
-    input_sh_3d = ref_img.get_fdata(dtype=np.float32)
-    input_sh_order = find_order_from_nb_coeff(input_sh_3d.shape)
-
-    # Fancy masking of 1d indices to limit spatial dilation to WM
-    sub_mask_3d = np.logical_and(
-        mask_data, todi_obj.reshape_to_3d(todi_obj.get_mask()))
-    sub_mask_1d = sub_mask_3d.flatten()[todi_obj.get_mask()]
-    todi_sf = todi_obj.get_todi()[sub_mask_1d]  # ** 2 # Sharpen
-
-    # The priors should always be between 0 and 1
-    # A minimum threshold is set to prevent misaligned FOD from disappearing
-    todi_sf /= np.max(todi_sf, axis=-1, keepdims=True)
-    todi_sf[todi_sf < args.sf_threshold] = args.sf_threshold
-
-    # Memory friendly saving, as soon as possible saving then delete
-    priors_3d = np.zeros(ref_img.shape)
-    sphere = get_sphere(name='repulsion724')
-    priors_3d[sub_mask_3d] = sf_to_sh(todi_sf, sphere,
-                                      sh_order_max=input_sh_order,
-                                      basis_type=args.sh_basis,
-                                      legacy=True)
-    filename = os.path.join(args.out_dir, "priors.nii.gz")
-    nib.save(nib.Nifti1Image(priors_3d, ref_img.affine), filename)
-    del priors_3d
-
-    input_sf_1d = sh_to_sf(input_sh_3d[sub_mask_3d],
-                           sphere, sh_order_max=input_sh_order,
-                           basis_type=args.sh_basis, legacy=True)
-
-    # Creation of the enhanced-FOD (direction-wise multiplication)
-    mult_sf_1d = input_sf_1d * todi_sf
-    del todi_sf
-
-    input_max_value = np.max(input_sf_1d, axis=-1, keepdims=True)
-    mult_max_value = np.max(mult_sf_1d, axis=-1, keepdims=True)
-    mult_positive_mask = np.squeeze(mult_max_value) > 0.0
-    mult_sf_1d[mult_positive_mask] = mult_sf_1d[mult_positive_mask] * \
-        input_max_value[mult_positive_mask] / \
-        mult_max_value[mult_positive_mask]
-
-    # Memory friendly saving
-    input_sh_3d[sub_mask_3d] = sf_to_sh(mult_sf_1d, sphere,
-                                        sh_order_max=input_sh_order,
-                                        basis_type=args.sh_basis,
-                                        legacy=True)
     filename = os.path.join(args.out_dir, "efod.nii.gz")
     nib.save(nib.Nifti1Image(input_sh_3d, ref_img.affine), filename)
     del input_sh_3d
@@ -330,14 +312,6 @@ def main():
     filename = os.path.join(args.out_dir, "distance_map.nii.gz")
     nib.save(nib.Nifti1Image(distance_map, ref_img.affine), filename)
 
-    filename = os.path.join(args.out_dir, "data_sh_dirac.nii.gz")
-    nib.save(nib.Nifti1Image(data_sh[..., 0], ref_img.affine), filename)
-
-    filename = os.path.join(args.out_dir, "data_sh_sphere.nii.gz")
-    nib.save(nib.Nifti1Image(data_sh[..., 1], ref_img.affine), filename)
-
-    filename = os.path.join(args.out_dir, "data_sh_donut.nii.gz")
-    nib.save(nib.Nifti1Image(data_sh[..., 2], ref_img.affine), filename)
 
 
 if __name__ == "__main__":
