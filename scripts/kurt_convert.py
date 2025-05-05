@@ -13,6 +13,7 @@ import multiprocessing
 import argparse
 import logging
 from scipy.spatial import KDTree
+from scipy import ndimage as ndi
 
 from scilpy.io.utils import (add_json_args,
                              add_overwrite_arg,
@@ -76,6 +77,7 @@ def main():
     # Check if the file exists
     mat_data = scipy.io.loadmat(args.in_assignement_files[0])
     B = mat_data['B']
+    print(f"Loaded {len(B)} signatures from {args.in_assignement_files[0]}")
 
     # Prepare TOMATCH (Python uses 0-based indexing, so start from column 1)
     # Ensure B has at least 2 columns
@@ -83,9 +85,11 @@ def main():
         raise ValueError(f"Error: Matrix 'B' loaded from {args.in_assignement_files[0]} "
                          "has fewer than 2 columns.")
     global all_signatures, all_signatures_dict
-    all_signatures = B[:, 1:].astype(np.uint8)
+    all_signatures = B[orig_labels].astype(np.uint8)
+    np.savetxt('all_signatures.txt', all_signatures, fmt='%d')
     all_signatures_dict = {hash(tuple(row)): i for i, row in enumerate(all_signatures)}
-
+    print(f"Using {len(all_signatures)} signatures from {args.in_assignement_files[0]}")
+    
     # Get the first column of B for finding indices
     tmp = B[:, 0]
 
@@ -117,7 +121,7 @@ def main():
         raise ValueError(f"WM file not found: {args.in_wm_mask}. Skipping subject.")
 
     nufo_img = nib.load(args.in_nufo)
-    nufo_data = nufo_img.get_fdata().astype(np.int32)
+    nufo_data = nufo_img.get_fdata().astype(np.uint8)
     nufo_data = np.clip(nufo_data, 0, 3)
 
     wm_img = nib.load(args.in_wm_mask)
@@ -141,17 +145,18 @@ def main():
         img = nib.load(tdi_path)
         data = img.get_fdata().astype(np.float32)
 
-        # Binarize it based on the threshold
-        data[data < thresh] = 0.0
-        data[data >= thresh] = 1.0
-
         label_index = labels[id_1, id_2] - 1
         tdi_data[..., label_index] = data
         count += 1
 
     if count != max_label:
-        print(
-            f"Warning: Expected {max_label - 1} TDI files, but found {count}.")
+        print(f"Warning: Expected {max_label} TDI files, but found {count}.")
+
+    inv_mask_sum = np.zeros_like(wm_mask, dtype=np.uint8)
+    inv_mask_sum[np.sum(tdi_data, axis=-1) < 10] = 1
+    indices = np.where(inv_mask_sum)
+    tdi_data[indices] = 0
+    tdi_data[tdi_data > 0] = 1
 
     def _process_voxel(signature):
         """
@@ -159,70 +164,97 @@ def main():
         """
         global all_signatures, all_signatures_dict
         if np.sum(signature) == 0:
-            print("Skipping empty signature")
-            return 0
+            return -1
 
         curr_hash = hash(tuple(signature))
         # Check if the current signature is in the dictionary
         if curr_hash in all_signatures_dict:
             best_match = all_signatures_dict[curr_hash]
             return best_match + 1
-        return 0
-        # else:
-        #     # Calculate distances (Cityblock = Manhattan)
-        #     # signature not in the dictionary, so compute distances
-        #     D = cdist(signature.reshape(1, -1), all_signatures,
-        #             metric='cityblock')[0]
+        else:
+            for i in range(1, 4): # Max NUFO is 3
+                # Check if the current signature is a subset of any signature in all_signatures
+                if i == signature[0]:
+                    continue
+                elif curr_hash in all_signatures_dict:
+                    best_match = all_signatures_dict[curr_hash]
+                    return best_match + 1
 
-        #     best_match = np.argmin(D)
-        #     min_val = D[best_match]
-
-        # # Check if the minimum value is too high
-        # if min_val >= 10:
+        # if np.sum(signature[1:]) < 5:
         #     return -1
+        # Calculate distances (Cityblock = Manhattan)
+        # signature not in the dictionary, so compute distances
+        D = cdist(signature[1:].reshape(1, -1), all_signatures[:, 1:],
+                metric='cityblock')[0]
 
-        # return best_match + 1 if best_match else 0
+        best_match = np.argmin(D)
+        # min_dist = D[best_match]
+        return best_match +1
 
     # Flatten except the last dimension
     intersection_mask = np.sum(tdi_data, axis=-1) > 0 & wm_mask
     tdi_data = tdi_data[intersection_mask]
     nufo_data = nufo_data[intersection_mask]
     num_voxels = np.count_nonzero(intersection_mask)
-    labels_ravel = np.zeros_like(nufo_data, dtype=np.int32)
+    labels_ravel = np.zeros_like(nufo_data, dtype=np.uint16)
 
     # Voxel-wise processing of signatures
     for pos in tqdm.tqdm(range(num_voxels), total=num_voxels):
         curr_signature = tdi_data[pos]
+        curr_signature = np.insert(curr_signature, 0, nufo_data[pos])
         best_match = _process_voxel(curr_signature)
-
-        # Check if the result is valid
-        if best_match == -1:
-            continue
         
-        labels_ravel[pos] = mapping_labels.get(best_match, -2)
-        # labels_ravel[pos] = best_match
+        # labels_ravel[pos] = mapping_labels.get(best_match, -2)
+        labels_ravel[pos] = best_match
 
-    labels = np.zeros_like(wm_data, dtype=np.int32)
+    labels = np.zeros_like(wm_data, dtype=np.uint16)
     labels[intersection_mask] = labels_ravel
-    coord_unfound = np.argwhere(labels == -2)
+
+    nib.save(nib.Nifti1Image(labels, wm_img.affine), 'test_labels.nii.gz')
+    # Remove unconnected island for each label
+    min_voxel_count = 6
+    voxel_to_remove = np.ones_like(labels, dtype=np.uint8)
+    print("a", np.unique(labels, return_counts=True))
+    for label_id in tqdm.tqdm(np.unique(labels)[1:]):
+        curr_data = np.zeros_like(labels, dtype=np.uint8)
+        curr_data[labels == label_id] = 1
+        components, nb_structures = ndi.label(curr_data)
+        # For each label, remove small components
+        for label in range(1, nb_structures + 1):
+            if np.count_nonzero(components == label) < min_voxel_count:
+                voxel_to_remove[components == label] = 0
+    labels *= voxel_to_remove
+    print(np.count_nonzero(voxel_to_remove))
+    print("a", np.unique(labels, return_counts=True))
+    nib.save(nib.Nifti1Image(labels, wm_img.affine), 'test_labels_c.nii.gz')
+
+    coord_unfound = np.argwhere((wm_mask > 0) & (labels == 0))
     coord_found = np.argwhere(labels > 0)
+
     tree = KDTree(coord_found)
     _, idx = tree.query(coord_unfound, k=1, distance_upper_bound=5)
+    # valid_idx = idx[~np.isinf(idx)]
+    # coord_found = coord_found[valid_idx]
+    # coord_unfound = coord_unfound[~np.isinf(idx)]
+    print(len(coord_found), len(coord_unfound), len(idx), np.max(idx))
 
-    # Filter out invalid indices (e.g., those that exceed the length of coord_found)
+    # # Filter out invalid indices (e.g., those that exceed the length of coord_found)
     valid_idx_mask = idx < len(coord_found)
-    # valid_idx = idx[valid_idx_mask]
-    invalid_idx = ~valid_idx_mask
+    valid_idx = idx[valid_idx_mask]
 
     # Extract the labels at the neighbor coordinates
+    labels_found = labels[coord_found[valid_idx, 0],
+                          coord_found[valid_idx, 1],
+                          coord_found[valid_idx, 2]]
+    # Assign the labels to the unfound coordinates
     labels[coord_unfound[valid_idx_mask, 0],
            coord_unfound[valid_idx_mask, 1],
-           coord_unfound[valid_idx_mask, 2]] = new_labels
+           coord_unfound[valid_idx_mask, 2]] = labels_found
 
     #deal with the invalid indexes.
-    labels[coord_unfound[invalid_idx, 0],
-           coord_unfound[invalid_idx, 1],
-           coord_unfound[invalid_idx, 2]] = -1
+    # labels[coord_unfound[invalid_idx, 0],
+    #        coord_unfound[invalid_idx, 1],
+    #        coord_unfound[invalid_idx, 2]] = -1
 
     print(f"Saving labels to: {args.out_labels}")
     nib.save(nib.Nifti1Image(labels, wm_img.affine), args.out_labels)
