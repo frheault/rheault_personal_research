@@ -93,7 +93,7 @@ def main():
     wm_mask = wm_data > 0.0
 
     max_label = np.max(labels[labels > 0])
-    tdi_data = np.zeros(wm_data.shape + (max_label,), dtype=np.uint32)
+    tdi_data = np.zeros(wm_data.shape + (max_label,), dtype=float)
 
     assert_headers_compatible(wm_img, [nufo_img])
     print(f"Initialized labels array with shape: {tdi_data.shape}")
@@ -114,16 +114,30 @@ def main():
 
         label_index = labels[id_1, id_2] - 1
         tdi_data[..., label_index] = data
+
         count += 1
 
     if count != max_label:
         print(f"Warning: Expected {max_label} TDI files, but found {count}.")
 
-    inv_mask_sum = np.zeros_like(wm_mask, dtype=np.uint8)
-    inv_mask_sum[np.sum(tdi_data, axis=-1) < 10] = 1
-    indices = np.where(inv_mask_sum)
-    tdi_data[indices] = 0
-    tdi_data[tdi_data > 0] = 1
+    # Voxel-wise normalization of TDI data and thresholding,
+    # contribution below THR is set to 0
+    THR = 0.10
+    mask_sum = np.sum(tdi_data, axis=-1).astype(float)
+    for ind in np.argwhere(mask_sum > 0):
+        ind = tuple(ind)
+        tmp_tdi_data = tdi_data[ind] / mask_sum[ind]
+        tmp_tdi_data[tmp_tdi_data < THR] = 0
+        tmp_sum = np.sum(tmp_tdi_data).astype(float)
+        if tmp_sum < 1e-6:
+            tmp_tdi_data[:] = 0
+        else:
+            tmp_tdi_data /= tmp_sum
+        
+        # This should be ceil to ensure integer values (binarize)
+        tdi_data[ind] = np.ceil(tmp_tdi_data)
+
+    tdi_data = tdi_data.astype(np.uint8)
 
     def _process_voxel(signature):
         """
